@@ -3,6 +3,7 @@
  * Uses a global variable so state survives Next.js hot-reloads in development.
  */
 
+import { dbLoad, dbSave, dbLoadAll, dbSaveAll } from './db';
 import type { GameState, GameSettings, CardColor, UnoCard } from '@/types/uno';
 import {
   initializeGame,
@@ -166,7 +167,7 @@ function setTurnStart(room: Room) {
 
   const currentId = gs.players[gs.currentPlayerIndex].id;
   if (isAutoPlay(room, currentId)) {
-    room.botMoveAfter = Date.now() + Math.floor(Math.random() * 15_000);
+    room.botMoveAfter = Date.now() + Math.floor(Math.random() * 3_000);
   }
 }
 
@@ -512,4 +513,50 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
     default:
       return { error: 'Unknown action' };
   }
+}
+
+// ─── Supabase sync helpers (called from API routes) ───────────────────────────
+
+/**
+ * Load a single room from Supabase into the in-memory store.
+ * If the room has never been saved, seeds Supabase with the default empty state.
+ */
+export async function syncRoomFromDB(roomId: string): Promise<void> {
+  const dbRoom = await dbLoad(roomId);
+  if (dbRoom) {
+    store.set(roomId, dbRoom as Room);
+  } else {
+    // First time this room is accessed — seed Supabase with the default state
+    const room = store.get(roomId);
+    if (room) await dbSave(room.id, room.name, room);
+  }
+}
+
+/**
+ * Load all rooms from Supabase.  Seeds any missing rooms into Supabase.
+ */
+export async function syncAllRoomsFromDB(): Promise<void> {
+  const rows = await dbLoadAll();
+  const byId = new Map(rows.map((r: Room) => [r.id, r]));
+
+  for (const room of store.values()) {
+    const dbRoom = byId.get(room.id);
+    if (dbRoom) {
+      store.set(room.id, dbRoom);
+    } else {
+      await dbSave(room.id, room.name, room);
+    }
+  }
+}
+
+/** Persist a single room to Supabase after an action. */
+export async function persistRoom(roomId: string): Promise<void> {
+  const room = store.get(roomId);
+  if (room) await dbSave(room.id, room.name, room);
+}
+
+/** Persist all rooms to Supabase (used after admin reset). */
+export async function persistAllRooms(): Promise<void> {
+  const rows = Array.from(store.values()).map(r => ({ id: r.id, name: r.name, data: r }));
+  await dbSaveAll(rows);
 }

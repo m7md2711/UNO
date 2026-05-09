@@ -1,9 +1,8 @@
 import { NextResponse } from 'next/server';
-import { resetAllRooms } from '@/lib/room-store';
-import { clearAllSessions } from '@/lib/auth-store';
+import { resetAllRooms, persistAllRooms } from '@/lib/room-store';
 
 export async function POST() {
   resetAllRooms();
-  // Keep user accounts; only clear game sessions
+  await persistAllRooms();
   return NextResponse.json({ ok: true, message: 'All rooms reset' });
 }
