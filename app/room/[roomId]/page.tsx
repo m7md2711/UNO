@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   ArrowLeft, Bot, Users, Play, Plus, X,
   Trophy, RotateCcw, Home, Crown, Volume2, VolumeX,
-  AlertCircle, Coffee,
+  AlertCircle, Coffee, Star,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { GlassPanel } from '@/components/ui/glass-panel';
@@ -14,14 +14,13 @@ import { Hand } from '@/components/game/hand';
 import { DiscardPile, DrawPile, ColorPicker } from '@/components/game/piles';
 import { canPlayCard, getPlayableCards, getNextPlayerIndex, type BotDifficulty } from '@/lib/game-logic';
 import type { Room, RoomPlayer } from '@/lib/room-store';
-import type { UnoCard, CardColor, GameState, Player } from '@/types/uno';
+import type { UnoCard, CardColor, Player } from '@/types/uno';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const TURN_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL   =  1_000;
 
-const BOT_DIFFICULTIES: BotDifficulty[] = ['easy', 'medium', 'hard'];
 const BOT_AVATARS: Record<BotDifficulty, string> = { easy: '🤖', medium: '🦾', hard: '🧠' };
 
 const TABLE_POSITIONS = {
@@ -36,15 +35,16 @@ const TABLE_POSITIONS = {
 
 type Pos = 'bottom'|'top'|'left'|'right'|'top-left'|'top-right'|'bottom-left'|'bottom-right';
 
-// ─── Auth helpers — read from localStorage (set by /auth page) ───────────────
+// ─── Session helpers ──────────────────────────────────────────────────────────
 
-function getAuthId(): string {
+function getPlayerId(): string {
   if (typeof window === 'undefined') return '';
-  return localStorage.getItem('uno-user-id') ?? sessionStorage.getItem('uno-player-id') ?? '';
+  let id = sessionStorage.getItem('uno-player-id');
+  if (!id) { id = Math.random().toString(36).substring(2, 11); sessionStorage.setItem('uno-player-id', id); }
+  return id;
 }
-function getAuthName(): string {
-  if (typeof window === 'undefined') return '';
-  return localStorage.getItem('uno-displayname') ?? sessionStorage.getItem('uno-player-name') ?? '';
+function getPlayerName(): string {
+  return typeof window !== 'undefined' ? sessionStorage.getItem('uno-player-name') ?? '' : '';
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -53,34 +53,37 @@ export default function RoomPage() {
   const { roomId } = useParams() as { roomId: string };
   const router     = useRouter();
 
-  const playerId   = useRef(getAuthId()).current;
-  const playerName = useRef(getAuthName()).current;
+  const playerId   = useRef(getPlayerId()).current;
+  const playerName = useRef(getPlayerName()).current;
 
-  const [room,           setRoom]           = useState<Room | null>(null);
-  const [timeLeft,       setTimeLeft]       = useState(30);
-  const [showColorPick,  setShowColorPick]  = useState(false);
-  const [pendingCard,    setPendingCard]    = useState<UnoCard | null>(null);
-  const [soundOn,        setSoundOn]        = useState(true);
-  const [addBotDiff,     setAddBotDiff]     = useState<BotDifficulty>('medium');
-  const [busySend,       setBusySend]       = useState(false);
+  const [room,          setRoom]          = useState<Room | null>(null);
+  const [timeLeft,      setTimeLeft]      = useState(30);
+  const [showColorPick, setShowColorPick] = useState(false);
+  const [pendingCard,   setPendingCard]   = useState<UnoCard | null>(null);
+  const [soundOn,       setSoundOn]       = useState(true);
+  const [addBotDiff,    setAddBotDiff]    = useState<BotDifficulty>('medium');
+  const [busySend,      setBusySend]      = useState(false);
 
-  // ── Poll room state every second ───────────────────────────────────────────
+  // Keep a ref to current room so the interval trigger can read it without stale closures
+  const roomRef     = useRef<Room | null>(null);
+  const triggerBusy = useRef(false);
+
+  useEffect(() => { roomRef.current = room; }, [room]);
+
+  // ── Poll ───────────────────────────────────────────────────────────────────
   const poll = useCallback(async () => {
     try {
       const res = await fetch(`/api/rooms/${roomId}?playerId=${playerId}`, { cache: 'no-store' });
       if (!res.ok) return;
-      const data: Room = await res.json();
-      setRoom(data);
+      setRoom(await res.json());
     } catch {}
   }, [roomId, playerId]);
 
-  useEffect(() => {
-    if (!playerId) { router.replace('/auth'); return; }
-    // Sync sessionStorage so legacy code paths still work
-    sessionStorage.setItem('uno-player-id',   playerId);
-    sessionStorage.setItem('uno-player-name', playerName);
+  const pollRef = useRef(poll);
+  useEffect(() => { pollRef.current = poll; }, [poll]);
 
-    // Join / re-join
+  // ── Join + poll loop ───────────────────────────────────────────────────────
+  useEffect(() => {
     if (playerName) {
       fetch(`/api/rooms/${roomId}`, {
         method: 'POST',
@@ -91,48 +94,59 @@ export default function RoomPage() {
     poll();
     const iv = setInterval(poll, POLL_INTERVAL);
     return () => clearInterval(iv);
-  }, [roomId, playerId, playerName, poll, router]);
+  }, [roomId, playerId, playerName, poll]);
 
-  // ── Turn timer countdown ───────────────────────────────────────────────────
+  // ── Timer countdown ────────────────────────────────────────────────────────
   useEffect(() => {
     const iv = setInterval(() => {
-      if (!room?.turnStartTime) return;
-      const elapsed = Date.now() - room.turnStartTime;
+      const r = roomRef.current;
+      if (!r?.turnStartTime) return;
+      const elapsed = Date.now() - r.turnStartTime;
       setTimeLeft(Math.max(0, Math.round((TURN_TIMEOUT_MS - elapsed) / 1000)));
     }, 100);
     return () => clearInterval(iv);
-  }, [room?.turnStartTime]);
+  }, []);
 
-  // ── Automatic triggers (timeout / bot / afk-bot / uno-penalty) ───────────
+  // ── Auto-trigger: timeout / bot-move / uno-penalty ────────────────────────
+  // Uses an interval + ref to avoid the stale-closure bug of dep-based effects.
   useEffect(() => {
-    if (!room?.gameState || room.phase !== 'playing') return;
-    const gs = room.gameState;
+    const iv = setInterval(async () => {
+      if (triggerBusy.current) return;
+      const r = roomRef.current;
+      if (!r?.gameState || r.phase !== 'playing') return;
+      const gs  = r.gameState;
+      const now = Date.now();
 
-    // 1. Turn timeout
-    if (Date.now() - room.turnStartTime >= TURN_TIMEOUT_MS) {
-      action({ type: 'timeout', playerId, turnIndex: gs.currentPlayerIndex });
-      return;
-    }
+      let body: object | null = null;
 
-    // 2. Bot move (also covers AFK players who have botMoveAfter set)
-    if (room.botMoveAfter && Date.now() >= room.botMoveAfter) {
-      const currentPlayer = gs.players[gs.currentPlayerIndex];
-      const roomPlayer    = room.players.find(p => p.id === currentPlayer.id);
-      const isAutoPlay    = roomPlayer?.isBot || (room.afkPlayerIds ?? []).includes(currentPlayer.id);
-      if (isAutoPlay) {
-        action({ type: 'bot-move', playerId, turnIndex: gs.currentPlayerIndex });
-        return;
+      if (now - r.turnStartTime >= TURN_TIMEOUT_MS) {
+        body = { type: 'timeout', playerId, turnIndex: gs.currentPlayerIndex };
+      } else if (r.botMoveAfter !== null && now >= r.botMoveAfter) {
+        const cp = gs.players[gs.currentPlayerIndex];
+        const rp = r.players.find(p => p.id === cp.id);
+        if (rp?.isBot || (r.afkPlayerIds ?? []).includes(cp.id)) {
+          body = { type: 'bot-move', playerId, turnIndex: gs.currentPlayerIndex };
+        }
+      } else if (r.unoPendingId && r.unoDeadline && now >= r.unoDeadline) {
+        body = { type: 'uno-penalty', playerId, targetId: r.unoPendingId };
       }
-    }
 
-    // 3. UNO penalty
-    if (room.unoPendingId && room.unoDeadline && Date.now() >= room.unoDeadline) {
-      action({ type: 'uno-penalty', playerId, targetId: room.unoPendingId });
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [room?.turnStartTime, room?.botMoveAfter, room?.unoDeadline]);
+      if (!body) return;
+      triggerBusy.current = true;
+      try {
+        await fetch(`/api/rooms/${roomId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        await pollRef.current();
+      } catch {}
+      triggerBusy.current = false;
+    }, 500);
+    return () => clearInterval(iv);
+  }, [roomId, playerId]);
 
-  // ── Send action to API ─────────────────────────────────────────────────────
+  // ── User action sender ─────────────────────────────────────────────────────
   async function action(body: object) {
     if (busySend) return;
     setBusySend(true);
@@ -147,7 +161,6 @@ export default function RoomPage() {
     setBusySend(false);
   }
 
-  // ── Leave ──────────────────────────────────────────────────────────────────
   async function handleLeave() {
     await action({ type: 'leave', playerId });
     router.push('/');
@@ -195,18 +208,17 @@ function LobbyView({ room, playerId, addBotDiff, setAddBotDiff, action, onLeave 
   return (
     <main className="min-h-screen gradient-bg flex flex-col items-center justify-center p-4">
       <div className="w-full max-w-xl space-y-4">
-        {/* Header */}
         <div className="flex items-center justify-between">
           <Button variant="ghost" size="sm" className="text-white/70 hover:text-white" onClick={onLeave}>
             <ArrowLeft className="w-4 h-4 mr-1" /> Leave
           </Button>
-          <GlassPanel className="px-4 py-2">
+          <GlassPanel className="px-4 py-2 text-center">
             <span className="font-mono text-primary font-bold text-lg">{room.name}</span>
+            <p className="text-xs text-yellow-400 mt-0.5">🏆 First to {room.matchTarget.toLocaleString()} pts</p>
           </GlassPanel>
           <div className="w-16" />
         </div>
 
-        {/* Players */}
         <GlassPanel className="p-5">
           <div className="flex items-center justify-between mb-4">
             <h2 className="font-bold flex items-center gap-2">
@@ -264,7 +276,6 @@ function LobbyView({ room, playerId, addBotDiff, setAddBotDiff, action, onLeave 
           </div>
         </GlassPanel>
 
-        {/* Start */}
         {isHost ? (
           <Button
             className="w-full h-12 text-lg font-bold bg-gradient-to-r from-primary to-accent"
@@ -276,7 +287,7 @@ function LobbyView({ room, playerId, addBotDiff, setAddBotDiff, action, onLeave 
           </Button>
         ) : (
           <GlassPanel className="p-4 text-center text-muted-foreground text-sm">
-            Waiting for host to start the game…
+            Waiting for host to start…
           </GlassPanel>
         )}
       </div>
@@ -285,53 +296,147 @@ function LobbyView({ room, playerId, addBotDiff, setAddBotDiff, action, onLeave 
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// GAME OVER VIEW
+// GAME OVER VIEW  (handles both round-end and match-winner states)
 // ═════════════════════════════════════════════════════════════════════════════
 
 function GameOverView({ room, playerId, action, onLeave }: {
   room: Room; playerId: string; action: (b: object) => void; onLeave: () => void;
 }) {
-  const gs = room.gameState;
-  if (!gs) return null;
+  const gs          = room.gameState;
+  const isHost      = room.hostId === playerId;
+  const hasWinner   = !!room.matchWinner;
+  const target      = room.matchTarget;
 
-  const scores    = [...gs.players].sort((a, b) => (gs.scores[b.id] ?? 0) - (gs.scores[a.id] ?? 0));
-  const topWinner = scores[0];
+  // Sort match scores descending
+  const matchRanking = room.players
+    .map(p => ({ id: p.id, name: p.name, score: room.matchScores[p.id] ?? 0 }))
+    .sort((a, b) => b.score - a.score);
 
+  // Round winner from gs.scores (highest per-round score)
+  const roundWinner = gs
+    ? [...(gs.players)].sort((a, b) => (gs.scores[b.id] ?? 0) - (gs.scores[a.id] ?? 0))[0]
+    : null;
+
+  const MEDALS = ['🥇', '🥈', '🥉'];
+
+  if (hasWinner) {
+    // ── Match winner screen ─────────────────────────────────────────────────
+    return (
+      <main className="min-h-screen gradient-bg flex items-center justify-center p-4">
+        <GlassPanel className="p-8 text-center max-w-md w-full">
+          <motion.div animate={{ scale: [1, 1.15, 1], rotate: [0, -8, 8, 0] }} transition={{ repeat: Infinity, duration: 1.2 }}>
+            <Trophy className="w-24 h-24 mx-auto text-yellow-400 mb-4" />
+          </motion.div>
+
+          <h2 className="text-4xl font-black text-white mb-1">Match Winner!</h2>
+          <p className="text-yellow-400 font-bold text-xl mb-1">
+            {room.matchWinnerName === gs?.players.find(p => p.id === playerId)?.name
+              ? '🎉 That\'s You!'
+              : `👑 ${room.matchWinnerName}`}
+          </p>
+          <p className="text-muted-foreground text-sm mb-6">
+            First to reach {target.toLocaleString()} points!
+          </p>
+
+          <div className="bg-white/5 rounded-xl p-4 mb-6 space-y-2">
+            <p className="text-xs text-muted-foreground uppercase tracking-wide mb-3">Final Scores</p>
+            {matchRanking.map((p, i) => (
+              <div key={p.id} className={`flex justify-between items-center px-3 py-2 rounded-lg ${i === 0 ? 'bg-yellow-500/20' : ''}`}>
+                <span className="flex items-center gap-2 text-sm">
+                  <span>{MEDALS[i] ?? '  '}</span>
+                  {p.id === playerId ? <strong>{p.name} (You)</strong> : p.name}
+                </span>
+                <span className="font-bold text-yellow-400">{p.score} pts</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex gap-3">
+            <Button variant="outline" className="flex-1" onClick={onLeave}>
+              <Home className="w-4 h-4 mr-2" /> Leave
+            </Button>
+            {isHost && (
+              <Button
+                className="flex-1 bg-gradient-to-r from-primary to-accent"
+                onClick={() => action({ type: 'new-match', playerId })}
+              >
+                <RotateCcw className="w-4 h-4 mr-2" /> New Match
+              </Button>
+            )}
+          </div>
+          {!isHost && (
+            <p className="text-xs text-muted-foreground mt-3">Waiting for host to start a new match…</p>
+          )}
+        </GlassPanel>
+      </main>
+    );
+  }
+
+  // ── Round-end screen ────────────────────────────────────────────────────────
   return (
     <main className="min-h-screen gradient-bg flex items-center justify-center p-4">
       <GlassPanel className="p-8 text-center max-w-md w-full">
-        <motion.div animate={{ rotate: [0, -10, 10, 0] }} transition={{ repeat: Infinity, duration: 0.5 }}>
-          <Trophy className="w-20 h-20 mx-auto text-yellow-400 mb-4" />
-        </motion.div>
+        <Star className="w-16 h-16 mx-auto text-yellow-400 mb-3" />
 
-        <h2 className="text-3xl font-black text-white mb-1">
-          {topWinner?.id === playerId ? '🎉 You Win!' : `${topWinner?.name} Wins!`}
-        </h2>
-        <p className="text-muted-foreground text-sm mb-6">Round complete</p>
+        <h2 className="text-3xl font-black text-white mb-1">Round Over!</h2>
+        <p className="text-muted-foreground text-sm mb-1">
+          {roundWinner?.id === playerId ? '🎉 You won the round!' : `${roundWinner?.name} won the round!`}
+        </p>
+        {roundWinner && gs && (
+          <p className="text-green-400 text-sm font-semibold mb-5">
+            +{gs.scores[roundWinner.id] ?? 0} points collected
+          </p>
+        )}
 
-        <div className="bg-white/5 rounded-xl p-4 mb-6 space-y-2">
-          {scores.map((p, i) => (
-            <div key={p.id} className={`flex justify-between items-center px-3 py-2 rounded-lg ${i === 0 ? 'bg-yellow-500/20' : ''}`}>
-              <span className="flex items-center gap-2 text-sm">
-                {i === 0 && <Trophy className="w-4 h-4 text-yellow-400" />}
-                {p.id === playerId ? <strong>{p.name} (You)</strong> : p.name}
-              </span>
-              <span className="font-bold">{gs.scores[p.id] ?? 0} pts</span>
-            </div>
-          ))}
+        {/* Match score progress */}
+        <div className="bg-white/5 rounded-xl p-4 mb-6">
+          <p className="text-xs text-muted-foreground uppercase tracking-wide mb-3">
+            Match Progress — first to {target.toLocaleString()} pts
+          </p>
+          <div className="space-y-3">
+            {matchRanking.map((p, i) => {
+              const pct = Math.min(100, (p.score / target) * 100);
+              return (
+                <div key={p.id}>
+                  <div className="flex justify-between text-xs mb-1">
+                    <span className="flex items-center gap-1">
+                      {MEDALS[i] && <span>{MEDALS[i]}</span>}
+                      <span className={p.id === playerId ? 'font-bold text-white' : 'text-muted-foreground'}>
+                        {p.name}{p.id === playerId ? ' (You)' : ''}
+                      </span>
+                    </span>
+                    <span className="font-mono font-bold text-white">{p.score} / {target}</span>
+                  </div>
+                  <div className="h-2 bg-white/10 rounded-full overflow-hidden">
+                    <motion.div
+                      className="h-full rounded-full bg-gradient-to-r from-primary to-accent"
+                      initial={{ width: 0 }}
+                      animate={{ width: `${pct}%` }}
+                      transition={{ duration: 0.8, ease: 'easeOut' }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         <div className="flex gap-3">
           <Button variant="outline" className="flex-1" onClick={onLeave}>
-            <Home className="w-4 h-4 mr-2" /> Home
+            <Home className="w-4 h-4 mr-2" /> Leave
           </Button>
-          {room.hostId === playerId && (
-            <Button className="flex-1 bg-gradient-to-r from-primary to-accent"
-              onClick={() => action({ type: 'start', playerId })}>
-              <RotateCcw className="w-4 h-4 mr-2" /> Play Again
+          {isHost && (
+            <Button
+              className="flex-1 bg-gradient-to-r from-primary to-accent"
+              onClick={() => action({ type: 'start', playerId })}
+            >
+              <Play className="w-4 h-4 mr-2" /> Next Round
             </Button>
           )}
         </div>
+        {!isHost && (
+          <p className="text-xs text-muted-foreground mt-3">Waiting for host to start the next round…</p>
+        )}
       </GlassPanel>
     </main>
   );
@@ -353,10 +458,10 @@ function GameView({
 }) {
   const gs = room.gameState!;
 
-  const myPlayer    = gs.players.find(p => p.id === playerId);
-  const isMyTurn    = gs.players[gs.currentPlayerIndex]?.id === playerId;
-  const isBotTurn   = room.players.find(p => p.id === gs.players[gs.currentPlayerIndex]?.id)?.isBot ?? false;
-  const isAfk       = (room.afkPlayerIds ?? []).includes(playerId);
+  const myPlayer  = gs.players.find(p => p.id === playerId);
+  const isMyTurn  = gs.players[gs.currentPlayerIndex]?.id === playerId;
+  const isBotTurn = room.players.find(p => p.id === gs.players[gs.currentPlayerIndex]?.id)?.isBot ?? false;
+  const isAfk     = (room.afkPlayerIds ?? []).includes(playerId);
 
   const nextIndex  = getNextPlayerIndex(gs.currentPlayerIndex, gs.direction, gs.players.length);
   const nextPlayer = gs.players[nextIndex];
@@ -369,7 +474,7 @@ function GameView({
   const unoPendingMe = room.unoPendingId === playerId;
   const unoTimeLeft  = room.unoDeadline ? Math.max(0, Math.ceil((room.unoDeadline - Date.now()) / 1000)) : 0;
 
-  const myIndex       = gs.players.findIndex(p => p.id === playerId);
+  const myIndex        = gs.players.findIndex(p => p.id === playerId);
   const orderedPlayers = myIndex >= 0
     ? [...gs.players.slice(myIndex), ...gs.players.slice(0, myIndex)]
     : gs.players;
@@ -388,28 +493,25 @@ function GameView({
   }
 
   const timerProgress = timeLeft / 30;
-  const timerColor = timerProgress > 0.5 ? '#22c55e' : timerProgress > 0.25 ? '#eab308' : '#ef4444';
+  const timerColor    = timerProgress > 0.5 ? '#22c55e' : timerProgress > 0.25 ? '#eab308' : '#ef4444';
 
   return (
     <main className="min-h-screen gradient-bg relative overflow-hidden flex flex-col">
 
-      {/* ── AFK Overlay ───────────────────────────────────────────────────── */}
+      {/* ── AFK Overlay ────────────────────────────────────────────────────── */}
       <AnimatePresence>
         {isAfk && (
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center gap-6 p-6"
           >
-            <motion.div
-              animate={{ y: [0, -10, 0] }}
-              transition={{ repeat: Infinity, duration: 2, ease: 'easeInOut' }}
-            >
+            <motion.div animate={{ y: [0, -10, 0] }} transition={{ repeat: Infinity, duration: 2 }}>
               <Coffee className="w-20 h-20 text-yellow-400" />
             </motion.div>
             <div className="text-center">
               <h2 className="text-3xl font-black text-white mb-2">You are AFK</h2>
               <p className="text-muted-foreground text-sm max-w-xs">
-                A bot is covering your turns. Press the button when you're ready to play again.
+                A bot is covering your turns. Press the button when you're ready.
               </p>
             </div>
             <Button
@@ -422,7 +524,7 @@ function GameView({
         )}
       </AnimatePresence>
 
-      {/* ── Header ───────────────────────────────────────────────────────── */}
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="z-20 px-4 pt-3 pb-2 flex items-center gap-3">
         <Button variant="ghost" size="sm" className="text-white/70 hover:text-white shrink-0" onClick={onLeave}>
           <ArrowLeft className="w-4 h-4" />
@@ -432,13 +534,13 @@ function GameView({
           <span className="font-mono text-primary font-bold text-sm">{room.name}</span>
         </GlassPanel>
 
-        {/* Turn timer bar */}
+        {/* Timer */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between text-xs mb-1">
             <span className="text-white/60">
               {isMyTurn && !isAfk
                 ? '⏱ Your turn'
-                : isBotTurn || isAfk
+                : isBotTurn || (isMyTurn && isAfk)
                   ? '🤖 Bot thinking…'
                   : `⏱ ${gs.players[gs.currentPlayerIndex]?.name}'s turn`}
             </span>
@@ -454,17 +556,25 @@ function GameView({
           </div>
         </div>
 
+        {/* Match score mini-badge */}
+        <div className="shrink-0 text-right">
+          <p className="text-[10px] text-muted-foreground">Match</p>
+          <p className="text-xs font-bold text-yellow-400">
+            {room.matchScores[playerId] ?? 0}/{room.matchTarget}
+          </p>
+        </div>
+
         <Button variant="ghost" size="icon" className="text-white/70 hover:text-white shrink-0"
           onClick={() => setSoundOn(!soundOn)}>
           {soundOn ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
         </Button>
       </header>
 
-      {/* ── Table ────────────────────────────────────────────────────────── */}
+      {/* ── Table ──────────────────────────────────────────────────────────── */}
       <div className="flex-1 flex items-center justify-center p-2 pb-0">
         <div className="relative w-full max-w-4xl" style={{ minHeight: 340 }}>
 
-          {/* Center: piles + direction */}
+          {/* Center piles */}
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center gap-6 z-10">
             <DrawPile
               cardCount={gs.drawPile.length}
@@ -477,16 +587,22 @@ function GameView({
               <div className="text-xs text-white/50">
                 {gs.direction === 1 ? '↻ Clockwise' : '↺ Counter'}
               </div>
+              {gs.pendingDraw > 0 && (
+                <div className="text-xs font-bold text-red-400 animate-pulse">
+                  +{gs.pendingDraw} stacked!
+                </div>
+              )}
             </div>
           </div>
 
           {/* Opponents */}
           {orderedPlayers.slice(1).map((player, idx) => {
-            const pos      = (TABLE_POSITIONS[orderedPlayers.length as keyof typeof TABLE_POSITIONS] || TABLE_POSITIONS[4])[idx + 1] as Pos;
-            const isActive = gs.players[gs.currentPlayerIndex].id === player.id;
-            const isNext   = nextPlayer?.id === player.id;
-            const roomP    = room.players.find(rp => rp.id === player.id);
-            const isOpponentAfk = (room.afkPlayerIds ?? []).includes(player.id);
+            const pos    = (TABLE_POSITIONS[orderedPlayers.length as keyof typeof TABLE_POSITIONS] || TABLE_POSITIONS[4])[idx + 1] as Pos;
+            const isActive  = gs.players[gs.currentPlayerIndex].id === player.id;
+            const isNext    = nextPlayer?.id === player.id;
+            const roomP     = room.players.find(rp => rp.id === player.id);
+            const isOppAfk  = (room.afkPlayerIds ?? []).includes(player.id);
+            const matchScore = room.matchScores[player.id] ?? 0;
             return (
               <OpponentSpot
                 key={player.id}
@@ -496,14 +612,16 @@ function GameView({
                 isNext={isNext && !isActive}
                 isBot={roomP?.isBot ?? false}
                 difficulty={roomP?.botDifficulty}
-                isAfk={isOpponentAfk}
+                isAfk={isOppAfk}
+                matchScore={matchScore}
+                matchTarget={room.matchTarget}
               />
             );
           })}
         </div>
       </div>
 
-      {/* ── UNO penalty warning ────────────────────────────────────────────── */}
+      {/* ── UNO penalty warning ─────────────────────────────────────────────── */}
       <AnimatePresence>
         {unoPendingMe && (
           <motion.div
@@ -518,7 +636,7 @@ function GameView({
         )}
       </AnimatePresence>
 
-      {/* ── Current turn badge ────────────────────────────────────────────── */}
+      {/* ── Turn badge ──────────────────────────────────────────────────────── */}
       {isMyTurn && !isAfk && (
         <div className="text-center mb-1">
           <motion.span
@@ -531,7 +649,7 @@ function GameView({
         </div>
       )}
 
-      {/* ── Player hand ──────────────────────────────────────────────────── */}
+      {/* ── My hand ────────────────────────────────────────────────────────── */}
       <div className="relative z-10 px-2 pb-1" style={{ minHeight: 120 }}>
         <div className="flex items-end justify-center" style={{ height: 110 }}>
           {myPlayer ? (
@@ -556,31 +674,26 @@ function GameView({
             <div>
               <p className="text-xs font-semibold text-white flex items-center gap-1">
                 {gs.players.find(p => p.id === playerId)?.name ?? 'You'}
-                {isAfk && (
-                  <span className="text-[9px] bg-yellow-500/30 text-yellow-400 px-1.5 py-0.5 rounded">AFK</span>
-                )}
-                {isMyTurn && !isAfk && (
-                  <span className="text-[10px] bg-primary/40 text-primary px-1.5 py-0.5 rounded">PLAYING</span>
-                )}
-                {nextPlayer?.id === playerId && !isMyTurn && !isAfk && (
-                  <span className="text-[10px] bg-orange-500/30 text-orange-400 px-1.5 py-0.5 rounded">NEXT</span>
-                )}
+                {isAfk && <span className="text-[9px] bg-yellow-500/30 text-yellow-400 px-1.5 py-0.5 rounded">AFK</span>}
+                {isMyTurn && !isAfk && <span className="text-[10px] bg-primary/40 text-primary px-1.5 py-0.5 rounded">PLAYING</span>}
+                {nextPlayer?.id === playerId && !isMyTurn && !isAfk && <span className="text-[10px] bg-orange-500/30 text-orange-400 px-1.5 py-0.5 rounded">NEXT</span>}
               </p>
               <p className="text-[10px] text-muted-foreground">{myPlayer?.hand.length ?? 0} cards</p>
             </div>
           </div>
           <div className="text-right">
-            <p className="text-xs text-muted-foreground">Score</p>
-            <p className="text-sm font-bold text-white">{gs.scores[playerId] ?? 0} pts</p>
+            <p className="text-xs text-muted-foreground">Round / Match</p>
+            <p className="text-sm font-bold text-white">
+              {gs.scores[playerId] ?? 0} / <span className="text-yellow-400">{room.matchScores[playerId] ?? 0}</span>
+            </p>
           </div>
         </div>
       </div>
 
-      {/* ── Action buttons ────────────────────────────────────────────────── */}
+      {/* ── Action buttons ──────────────────────────────────────────────────── */}
       <div className="z-20 px-3 pb-4 pt-2 border-t border-white/10">
         <div className="flex gap-2 max-w-sm mx-auto">
           {isAfk ? (
-            /* AFK: only show I'm Back button */
             <ActionBtn
               label="I'm Back!"
               emoji="👋"
@@ -618,17 +731,14 @@ function GameView({
         </div>
       </div>
 
-      {/* Color picker */}
       <ColorPicker isOpen={showColorPick} onColorSelect={handleColorSelect} />
     </main>
   );
 }
 
-// ─── Action Button ───────────────────────────────────────────────────────────
+// ─── Action Button ────────────────────────────────────────────────────────────
 
-function ActionBtn({
-  label, emoji, color, disabled, pulse, onClick,
-}: {
+function ActionBtn({ label, emoji, color, disabled, pulse, onClick }: {
   label: string; emoji: string; color: string;
   disabled: boolean; pulse?: boolean; onClick: () => void;
 }) {
@@ -642,8 +752,7 @@ function ActionBtn({
       className={`
         flex-1 flex flex-col items-center justify-center gap-0.5 py-3 rounded-2xl
         bg-gradient-to-b ${color} text-white font-bold text-xs shadow-lg
-        disabled:opacity-30 disabled:cursor-not-allowed
-        transition-all active:scale-95
+        disabled:opacity-30 disabled:cursor-not-allowed transition-all active:scale-95
       `}
     >
       <span className="text-xl">{emoji}</span>
@@ -652,7 +761,7 @@ function ActionBtn({
   );
 }
 
-// ─── Opponent Spot ────────────────────────────────────────────────────────────
+// ─── Opponent Spot ─────────────────────────────────────────────────────────────
 
 const POS_STYLES: Record<Pos, string> = {
   top:           'top-0 left-1/2 -translate-x-1/2',
@@ -665,21 +774,22 @@ const POS_STYLES: Record<Pos, string> = {
   'bottom-right':'bottom-6 right-4',
 };
 
-function OpponentSpot({ player, position, isActive, isNext, isBot, difficulty, isAfk }: {
+function OpponentSpot({ player, position, isActive, isNext, isBot, difficulty, isAfk, matchScore, matchTarget }: {
   player: Player; position: Pos;
-  isActive: boolean; isNext: boolean; isBot: boolean; difficulty?: BotDifficulty; isAfk: boolean;
+  isActive: boolean; isNext: boolean; isBot: boolean; difficulty?: BotDifficulty;
+  isAfk: boolean; matchScore: number; matchTarget: number;
 }) {
+  const pct = Math.min(100, (matchScore / matchTarget) * 100);
   return (
     <motion.div
       className={`absolute ${POS_STYLES[position]}`}
       initial={{ opacity: 0, scale: 0.8 }}
-      animate={{ opacity: isAfk ? 0.6 : 1, scale: isActive ? 1.12 : 1 }}
+      animate={{ opacity: isAfk ? 0.65 : 1, scale: isActive ? 1.12 : 1 }}
       transition={{ type: 'spring', stiffness: 200 }}
     >
-      <div className="flex flex-col items-center gap-1.5">
+      <div className="flex flex-col items-center gap-1">
         <div className={`
-          px-3 py-1.5 rounded-xl border-2 flex items-center gap-2 text-sm
-          transition-all duration-300
+          px-3 py-1.5 rounded-xl border-2 flex items-center gap-2 text-sm transition-all duration-300
           ${isActive
             ? 'border-green-400 bg-green-500/20 shadow-[0_0_16px_rgba(34,197,94,0.4)]'
             : isNext
@@ -697,37 +807,29 @@ function OpponentSpot({ player, position, isActive, isNext, isBot, difficulty, i
             <p className="text-[10px] text-muted-foreground">{player.hand.length} cards</p>
           </div>
 
-          {isAfk && (
-            <span className="text-[9px] bg-yellow-500/40 text-yellow-300 px-1.5 py-0.5 rounded font-bold ml-1">
-              AFK
-            </span>
-          )}
+          {isAfk && <span className="text-[9px] bg-yellow-500/40 text-yellow-300 px-1.5 py-0.5 rounded font-bold ml-1">AFK</span>}
           {isActive && !isAfk && (
             <motion.span
               className="text-[9px] bg-green-500 text-white px-1.5 py-0.5 rounded font-bold ml-1"
-              animate={{ opacity: [1, 0.5, 1] }}
-              transition={{ repeat: Infinity, duration: 0.8 }}
-            >
-              PLAYING
-            </motion.span>
+              animate={{ opacity: [1, 0.5, 1] }} transition={{ repeat: Infinity, duration: 0.8 }}
+            >PLAYING</motion.span>
           )}
           {isActive && isAfk && (
             <motion.span
               className="text-[9px] bg-yellow-500 text-white px-1.5 py-0.5 rounded font-bold ml-1"
-              animate={{ opacity: [1, 0.5, 1] }}
-              transition={{ repeat: Infinity, duration: 0.8 }}
-            >
-              BOT
-            </motion.span>
+              animate={{ opacity: [1, 0.5, 1] }} transition={{ repeat: Infinity, duration: 0.8 }}
+            >BOT</motion.span>
           )}
-          {isNext && !isActive && (
-            <span className="text-[9px] bg-orange-500/70 text-white px-1.5 py-0.5 rounded font-bold ml-1">
-              NEXT
-            </span>
-          )}
-          {player.hand.length === 1 && (
-            <span className="text-[9px] bg-red-500 text-white px-1.5 py-0.5 rounded font-bold">UNO</span>
-          )}
+          {isNext && !isActive && <span className="text-[9px] bg-orange-500/70 text-white px-1.5 py-0.5 rounded font-bold ml-1">NEXT</span>}
+          {player.hand.length === 1 && <span className="text-[9px] bg-red-500 text-white px-1.5 py-0.5 rounded font-bold">UNO</span>}
+        </div>
+
+        {/* Match score mini-bar */}
+        <div className="w-full px-1">
+          <div className="h-1 bg-white/10 rounded-full overflow-hidden">
+            <div className="h-full bg-yellow-400/70 rounded-full transition-all" style={{ width: `${pct}%` }} />
+          </div>
+          <p className="text-[9px] text-yellow-400/70 text-center mt-0.5">{matchScore} pts</p>
         </div>
 
         {/* Face-down cards */}
@@ -747,9 +849,7 @@ function OpponentSpot({ player, position, isActive, isNext, isBot, difficulty, i
               />
             </motion.div>
           ))}
-          {player.hand.length === 0 && (
-            <span className="text-xs text-white/40 italic">No cards</span>
-          )}
+          {player.hand.length === 0 && <span className="text-xs text-white/40 italic">No cards</span>}
         </div>
       </div>
     </motion.div>

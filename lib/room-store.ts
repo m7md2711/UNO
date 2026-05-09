@@ -36,16 +36,21 @@ export interface Room {
   hostId: string | null;
   // Turn timing
   turnStartTime: number;
-  botMoveAfter: number | null;   // timestamp for bot / AFK auto-play
+  botMoveAfter: number | null;
   drawnThisTurn: boolean;
   // UNO enforcement
   unoPendingId: string | null;
   unoDeadline: number | null;
   // AFK
-  afkPlayerIds: string[];        // human players temporarily controlled by bot AI
+  afkPlayerIds: string[];
+  // Match scoring (persists across rounds)
+  matchScores: Record<string, number>;
+  matchWinner: string | null;
+  matchWinnerName: string | null;
+  matchTarget: number;
 }
 
-export type RoomSummary = Pick<Room, 'id' | 'name' | 'phase'> & {
+export type RoomSummary = Pick<Room, 'id' | 'name' | 'phase' | 'matchTarget' | 'matchWinnerName'> & {
   humanCount: number;
   botCount: number;
   maxPlayers: number;
@@ -57,6 +62,7 @@ export type RoomAction =
   | { type: 'add-bot';      playerId: string; difficulty: BotDifficulty }
   | { type: 'remove-bot';   playerId: string; botId: string }
   | { type: 'start';        playerId: string }
+  | { type: 'new-match';    playerId: string }
   | { type: 'play-card';    playerId: string; cardId: string; chosenColor?: Exclude<CardColor, 'wild'> }
   | { type: 'draw-card';    playerId: string }
   | { type: 'skip-turn';    playerId: string }
@@ -64,7 +70,7 @@ export type RoomAction =
   | { type: 'timeout';      playerId: string; turnIndex: number }
   | { type: 'bot-move';     playerId: string; turnIndex: number }
   | { type: 'uno-penalty';  playerId: string; targetId: string }
-  | { type: 'return';       playerId: string };   // player returning from AFK
+  | { type: 'return';       playerId: string };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -72,6 +78,15 @@ const TURN_TIMEOUT_MS = 30_000;
 const UNO_WINDOW_MS   =  5_000;
 const MAX_PLAYERS     = 8;
 const BOT_NAMES       = ['RoboUno', 'CardBot', 'UnoMaster', 'WildCard', 'DrawFour', 'StackBot', 'ReverseBot'];
+
+// Points needed to WIN the match, per room
+const ROOM_TARGETS: Record<string, number> = {
+  'room-1':  500,
+  'room-2':  750,
+  'room-3': 1000,
+  'room-4': 1250,
+  'room-5': 1500,
+};
 
 // ─── Singleton store ──────────────────────────────────────────────────────────
 
@@ -92,6 +107,8 @@ function emptyRoom(id: string, name: string): Room {
     turnStartTime: Date.now(), botMoveAfter: null,
     drawnThisTurn: false, unoPendingId: null, unoDeadline: null,
     afkPlayerIds: [],
+    matchScores: {}, matchWinner: null, matchWinnerName: null,
+    matchTarget: ROOM_TARGETS[id] ?? 500,
   };
 }
 
@@ -103,6 +120,8 @@ export function getRoomSummaries(): RoomSummary[] {
     humanCount: r.players.filter(p => !p.isBot).length,
     botCount:   r.players.filter(p =>  p.isBot).length,
     maxPlayers: MAX_PLAYERS,
+    matchTarget: r.matchTarget,
+    matchWinnerName: r.matchWinnerName,
   }));
 }
 
@@ -147,7 +166,6 @@ function setTurnStart(room: Room) {
 
   const currentId = gs.players[gs.currentPlayerIndex].id;
   if (isAutoPlay(room, currentId)) {
-    // Random 0-15 second delay for bots / AFK players
     room.botMoveAfter = Date.now() + Math.floor(Math.random() * 15_000);
   }
 }
@@ -203,13 +221,29 @@ function applyPlayCard(
     room.unoPendingId = null; room.unoDeadline = null;
   }
 
-  // Winner
+  // Round winner — empty hand
   if (newHand.length === 0) {
-    const points = gs.players.filter(p => p.id !== player.id)
+    const roundPoints = gs.players
+      .filter(p => p.id !== player.id)
       .reduce((s, p) => s + calculateHandScore(p.hand), 0);
-    room.gameState.scores = { ...room.gameState.scores, [player.id]: (room.gameState.scores[player.id] ?? 0) + points };
-    room.gameState.phase  = 'round-end';
-    room.phase            = 'finished';
+
+    // Update per-round score in game state
+    room.gameState.scores = {
+      ...room.gameState.scores,
+      [player.id]: (room.gameState.scores[player.id] ?? 0) + roundPoints,
+    };
+
+    // Accumulate into match scores
+    room.matchScores[player.id] = (room.matchScores[player.id] ?? 0) + roundPoints;
+
+    // Check match winner
+    if (room.matchScores[player.id] >= room.matchTarget) {
+      room.matchWinner     = player.id;
+      room.matchWinnerName = player.name;
+    }
+
+    room.gameState.phase = 'round-end';
+    room.phase           = 'finished';
     return null;
   }
 
@@ -231,7 +265,7 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
     // ── Lobby ──────────────────────────────────────────────────────────────
     case 'join': {
       if (room.phase !== 'waiting') {
-        // Allow rejoining in-progress game if player is already a member
+        // Allow rejoining an in-progress game
         const existing = room.gameState?.players.find(p => p.id === action.playerId);
         if (existing) {
           const existingRoom = room.players.find(p => p.id === action.playerId);
@@ -287,17 +321,24 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
     case 'start': {
       if (room.hostId !== action.playerId) return { error: 'Not host' };
       if (room.players.length < 2) return { error: 'Need at least 2 players' };
-      if (room.phase !== 'waiting') {
-        // Allow host to restart a finished game
-        if (room.phase !== 'finished') return { error: 'Already in progress' };
-        // Reset game state for replay
+
+      if (room.phase === 'finished') {
+        // Between rounds: check if the whole match is already over
+        if (room.matchWinner) return { error: 'Match is over — use New Match to reset' };
+        // Next round: keep players and matchScores, just reset game state
         room.gameState    = null;
-        room.phase        = 'waiting';
         room.afkPlayerIds = [];
+      } else if (room.phase !== 'waiting') {
+        return { error: 'Already in progress' };
       }
+
       const settings: GameSettings = {
-        pointsToWin: 500, stackingEnabled: true, jumpInEnabled: false,
-        sevenZeroEnabled: false, turnTimer: 30, forcePlay: false,
+        pointsToWin: room.matchTarget,
+        stackingEnabled: true,
+        jumpInEnabled: false,
+        sevenZeroEnabled: false,
+        turnTimer: 30,
+        forcePlay: false,
       };
       const playersData = room.players.map(p => ({
         id: p.id, name: p.name,
@@ -307,6 +348,18 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
       room.gameState = initializeGame(room.id, playersData, settings);
       room.phase     = 'playing';
       setTurnStart(room);
+      return room;
+    }
+
+    case 'new-match': {
+      if (room.hostId !== action.playerId) return { error: 'Not host' };
+      // Reset match scores and winner, keep the same players in the lobby
+      room.matchScores     = {};
+      room.matchWinner     = null;
+      room.matchWinnerName = null;
+      room.gameState       = null;
+      room.phase           = 'waiting';
+      room.afkPlayerIds    = [];
       return room;
     }
 
@@ -333,13 +386,18 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
       if (room.drawnThisTurn && gs.pendingDraw === 0) return { error: 'Already drew' };
 
       let { drawPile, discardPile } = gs;
-      if (drawPile.length === 0) { const r = reshuffleDeck(drawPile, discardPile); drawPile = r.drawPile; discardPile = r.discardPile; }
+      if (drawPile.length === 0) {
+        const r = reshuffleDeck(drawPile, discardPile);
+        drawPile = r.drawPile; discardPile = r.discardPile;
+      }
+      if (drawPile.length === 0) return { error: 'No cards left to draw' };
 
-      const count = gs.pendingDraw > 0 ? gs.pendingDraw : 1;
-      const drawn = drawPile.slice(0, count);
+      const count  = gs.pendingDraw > 0 ? gs.pendingDraw : 1;
+      const drawn  = drawPile.slice(0, count);
       const newPlayers = gs.players.map((p, i) => i === pi ? { ...p, hand: [...p.hand, ...drawn] } : p);
 
       if (gs.pendingDraw > 0) {
+        // Drawing the penalty: advance turn
         const next = getNextPlayerIndex(pi, gs.direction, gs.players.length);
         room.gameState = { ...gs, players: newPlayers, drawPile: drawPile.slice(count), discardPile, currentPlayerIndex: next, pendingDraw: 0 };
         setTurnStart(room);
@@ -377,7 +435,7 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
 
       const currentId = gs.players[gs.currentPlayerIndex].id;
 
-      // Mark as AFK (if it's a human player who missed their turn)
+      // Mark human as AFK
       const rp2 = room.players.find(p => p.id === currentId);
       if (!rp2?.isBot && !room.afkPlayerIds.includes(currentId)) {
         room.afkPlayerIds.push(currentId);
@@ -386,10 +444,10 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
       // Draw 1 card and advance turn
       let { drawPile, discardPile } = gs;
       if (drawPile.length === 0) { const r = reshuffleDeck(drawPile, discardPile); drawPile = r.drawPile; discardPile = r.discardPile; }
-      const drawn = drawPile.slice(0, 1);
+      const drawn = drawPile.length > 0 ? drawPile.slice(0, 1) : [];
       const newPlayers = gs.players.map((p, i) => i === gs.currentPlayerIndex ? { ...p, hand: [...p.hand, ...drawn] } : p);
       const next = getNextPlayerIndex(gs.currentPlayerIndex, gs.direction, gs.players.length);
-      room.gameState = { ...gs, players: newPlayers, drawPile: drawPile.slice(1), discardPile, currentPlayerIndex: next, pendingDraw: 0 };
+      room.gameState = { ...gs, players: newPlayers, drawPile: drawPile.slice(drawn.length), discardPile, currentPlayerIndex: next, pendingDraw: 0 };
       setTurnStart(room);
       return room;
     }
@@ -403,8 +461,7 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
       const currentId = gs.players[gs.currentPlayerIndex].id;
       if (!isAutoPlay(room, currentId)) return { error: 'Not a bot/AFK turn' };
 
-      // Lock to prevent duplicate execution
-      room.botMoveAfter = null;
+      room.botMoveAfter = null; // lock
 
       const botRoomPlayer = room.players.find(p => p.id === currentId);
       const diff = botRoomPlayer?.isBot ? (botRoomPlayer.botDifficulty ?? 'medium') : 'medium';
@@ -417,7 +474,6 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
 
       if (card) {
         const err = applyPlayCard(room, gs.currentPlayerIndex, card, chosenColor);
-        // Auto-clear UNO pending for bots / AFK
         if (!err && room.unoPendingId === currentId) { room.unoPendingId = null; room.unoDeadline = null; }
         return err ? { error: err } : room;
       } else {
@@ -442,14 +498,12 @@ export function performAction(roomId: string, action: RoomAction): Room | { erro
     }
 
     case 'return': {
-      // Player coming back from AFK
       room.afkPlayerIds = room.afkPlayerIds.filter(id => id !== action.playerId);
-      // If it's currently their turn, cancel the bot timer so they can play
       if (room.gameState) {
         const currentId = room.gameState.players[room.gameState.currentPlayerIndex]?.id;
         if (currentId === action.playerId) {
           room.botMoveAfter  = null;
-          room.turnStartTime = Date.now(); // reset timer for fairness
+          room.turnStartTime = Date.now();
         }
       }
       return room;

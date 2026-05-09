@@ -3,58 +3,53 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
-import { Users, Bot, Crown, LogOut, RotateCcw, ShieldAlert } from 'lucide-react';
+import { Users, Bot, Crown, LogIn, ShieldAlert, Trophy } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { FloatingCards } from '@/components/game/card-showcase';
 import type { RoomSummary } from '@/lib/room-store';
 
 const PHASE_COLORS: Record<string, string> = {
   waiting:  'text-green-400',
   playing:  'text-yellow-400',
-  finished: 'text-muted-foreground',
+  finished: 'text-orange-400',
 };
 
 const PHASE_LABELS: Record<string, string> = {
   waiting:  'Open',
   playing:  'In Progress',
-  finished: 'Finished',
+  finished: 'Round Over',
 };
+
+function getOrCreatePlayerId(): string {
+  if (typeof window === 'undefined') return '';
+  let id = sessionStorage.getItem('uno-player-id');
+  if (!id) {
+    id = Math.random().toString(36).substring(2, 11);
+    sessionStorage.setItem('uno-player-id', id);
+  }
+  return id;
+}
 
 export default function HomePage() {
   const router = useRouter();
 
-  const [userId,      setUserId]      = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [token,       setToken]       = useState('');
+  const [playerName,  setPlayerName]  = useState('');
+  const [savedName,   setSavedName]   = useState('');
+  const [editingName, setEditingName] = useState(false);
   const [rooms,       setRooms]       = useState<RoomSummary[]>([]);
   const [joining,     setJoining]     = useState<string | null>(null);
   const [resetting,   setResetting]   = useState(false);
-  const [authReady,   setAuthReady]   = useState(false);
 
-  // Auth guard — redirect to /auth if no valid token
   useEffect(() => {
-    const t  = localStorage.getItem('uno-token')       ?? '';
-    const id = localStorage.getItem('uno-user-id')     ?? '';
-    const dn = localStorage.getItem('uno-displayname') ?? '';
-
-    if (!t || !id) { router.replace('/auth'); return; }
-
-    fetch(`/api/auth/me?token=${t}`).then(r => {
-      if (!r.ok) { router.replace('/auth'); return; }
-      setToken(t);
-      setUserId(id);
-      setDisplayName(dn);
-      setAuthReady(true);
-    }).catch(() => router.replace('/auth'));
-  }, [router]);
-
-  // Poll rooms
-  useEffect(() => {
-    if (!authReady) return;
+    const name = sessionStorage.getItem('uno-player-name') ?? '';
+    setSavedName(name);
+    setPlayerName(name);
+    if (!name) setEditingName(true);
     fetchRooms();
     const iv = setInterval(fetchRooms, 3000);
     return () => clearInterval(iv);
-  }, [authReady]);
+  }, []);
 
   async function fetchRooms() {
     try {
@@ -63,15 +58,12 @@ export default function HomePage() {
     } catch {}
   }
 
-  async function handleLogout() {
-    await fetch('/api/auth/logout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
-    }).catch(() => {});
-    ['uno-token','uno-user-id','uno-username','uno-displayname'].forEach(k => localStorage.removeItem(k));
-    ['uno-player-id','uno-player-name'].forEach(k => sessionStorage.removeItem(k));
-    router.replace('/auth');
+  function saveName() {
+    const trimmed = playerName.trim();
+    if (!trimmed) return;
+    sessionStorage.setItem('uno-player-name', trimmed);
+    setSavedName(trimmed);
+    setEditingName(false);
   }
 
   async function handleReset() {
@@ -85,18 +77,16 @@ export default function HomePage() {
   }
 
   async function joinRoom(roomId: string) {
-    if (!userId || !displayName) return;
+    const name = savedName.trim();
+    if (!name) { setEditingName(true); return; }
     setJoining(roomId);
 
-    // Keep sessionStorage in sync for the room page
-    sessionStorage.setItem('uno-player-id',   userId);
-    sessionStorage.setItem('uno-player-name', displayName);
-
+    const playerId = getOrCreatePlayerId();
     try {
       const res = await fetch(`/api/rooms/${roomId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'join', playerId: userId, playerName: displayName }),
+        body: JSON.stringify({ type: 'join', playerId, playerName: name }),
       });
       if (res.ok) {
         router.push(`/room/${roomId}`);
@@ -109,14 +99,6 @@ export default function HomePage() {
     } finally {
       setJoining(null);
     }
-  }
-
-  if (!authReady) {
-    return (
-      <div className="min-h-screen gradient-bg flex items-center justify-center text-white text-xl">
-        Loading…
-      </div>
-    );
   }
 
   return (
@@ -148,25 +130,46 @@ export default function HomePage() {
           </h2>
         </motion.div>
 
-        {/* User identity strip */}
+        {/* Name panel */}
         <motion.div
-          className="glass rounded-2xl p-4 w-full max-w-sm flex items-center justify-between"
+          className="glass rounded-2xl p-6 w-full max-w-sm"
           initial={{ opacity: 0, scale: 0.95 }}
           animate={{ opacity: 1, scale: 1 }}
           transition={{ delay: 0.1 }}
         >
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-primary to-accent flex items-center justify-center text-white font-bold text-lg">
-              {displayName[0]?.toUpperCase()}
+          {editingName ? (
+            <div className="space-y-3">
+              <p className="text-sm font-medium text-muted-foreground">Enter your name to play</p>
+              <Input
+                autoFocus
+                placeholder="Your name…"
+                value={playerName}
+                onChange={e => setPlayerName(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && saveName()}
+                className="text-center text-lg bg-input/50"
+                maxLength={20}
+              />
+              <Button className="w-full bg-gradient-to-r from-primary to-accent" onClick={saveName}>
+                <LogIn className="w-4 h-4 mr-2" />
+                Set Name &amp; Play
+              </Button>
             </div>
-            <div>
-              <p className="font-bold text-white">{displayName}</p>
-              <p className="text-xs text-muted-foreground">Signed in</p>
+          ) : (
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-primary to-accent flex items-center justify-center text-white font-bold text-lg">
+                  {savedName[0]?.toUpperCase()}
+                </div>
+                <div>
+                  <p className="font-bold text-white">{savedName}</p>
+                  <p className="text-xs text-muted-foreground">Playing as</p>
+                </div>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => setEditingName(true)}>
+                Change
+              </Button>
             </div>
-          </div>
-          <Button variant="ghost" size="sm" onClick={handleLogout} className="text-muted-foreground hover:text-white">
-            <LogOut className="w-4 h-4 mr-1" /> Sign out
-          </Button>
+          )}
         </motion.div>
 
         {/* Rooms grid */}
@@ -189,18 +192,18 @@ export default function HomePage() {
               disabled={resetting}
             >
               <ShieldAlert className="w-3.5 h-3.5 mr-1" />
-              {resetting ? 'Resetting…' : 'Reset All Rooms'}
+              {resetting ? 'Resetting…' : 'Reset All'}
             </Button>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {rooms.length === 0
               ? Array.from({ length: 5 }).map((_, i) => (
-                  <div key={i} className="glass rounded-xl p-4 animate-pulse h-28" />
+                  <div key={i} className="glass rounded-xl p-4 animate-pulse h-32" />
                 ))
               : rooms.map((room, i) => {
-                  const isFull    = room.humanCount >= room.maxPlayers;
-                  const canJoin   = room.phase === 'waiting' && !isFull;
+                  const isFull  = room.humanCount >= room.maxPlayers;
+                  const canJoin = room.phase === 'waiting' && !isFull;
                   const totalPlayers = room.humanCount + room.botCount;
 
                   return (
@@ -212,18 +215,34 @@ export default function HomePage() {
                       className={`glass rounded-xl p-4 border-2 transition-all ${
                         canJoin
                           ? 'border-primary/30 hover:border-primary cursor-pointer hover:scale-105'
-                          : 'border-border/20 opacity-60'
+                          : 'border-border/20 opacity-70'
                       }`}
                       onClick={() => canJoin && joinRoom(room.id)}
                     >
-                      <div className="flex items-start justify-between mb-3">
+                      {/* Header row */}
+                      <div className="flex items-start justify-between mb-1">
                         <h3 className="font-bold text-white">{room.name}</h3>
                         <span className={`text-xs font-semibold ${PHASE_COLORS[room.phase]}`}>
                           {PHASE_LABELS[room.phase]}
                         </span>
                       </div>
 
-                      <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                      {/* Target */}
+                      <p className="text-[11px] text-yellow-400 font-medium mb-2 flex items-center gap-1">
+                        <Trophy className="w-3 h-3" />
+                        First to {room.matchTarget.toLocaleString()} pts wins
+                      </p>
+
+                      {/* Champion badge */}
+                      {room.matchWinnerName && (
+                        <p className="text-[11px] text-yellow-300 font-semibold mb-2 flex items-center gap-1">
+                          <Crown className="w-3 h-3 text-yellow-400" />
+                          Champion: {room.matchWinnerName}
+                        </p>
+                      )}
+
+                      {/* Player counts */}
+                      <div className="flex items-center gap-4 text-sm text-muted-foreground mb-3">
                         <span className="flex items-center gap-1">
                           <Users className="w-3.5 h-3.5" />
                           {room.humanCount}/{room.maxPlayers}
@@ -236,16 +255,14 @@ export default function HomePage() {
                         )}
                       </div>
 
-                      {/* Player slots visual */}
-                      <div className="flex gap-1 mt-3">
+                      {/* Slot bar */}
+                      <div className="flex gap-1 mb-2">
                         {Array.from({ length: room.maxPlayers }).map((_, j) => (
                           <div
                             key={j}
                             className={`flex-1 h-1.5 rounded-full ${
                               j < totalPlayers
-                                ? j < room.humanCount
-                                  ? 'bg-primary'
-                                  : 'bg-primary/40'
+                                ? j < room.humanCount ? 'bg-primary' : 'bg-primary/40'
                                 : 'bg-white/10'
                             }`}
                           />
@@ -255,15 +272,15 @@ export default function HomePage() {
                       {canJoin && (
                         <Button
                           size="sm"
-                          className="w-full mt-3 bg-gradient-to-r from-primary to-accent"
-                          disabled={joining === room.id}
+                          className="w-full bg-gradient-to-r from-primary to-accent"
+                          disabled={joining === room.id || !savedName}
                           onClick={e => { e.stopPropagation(); joinRoom(room.id); }}
                         >
                           {joining === room.id ? 'Joining…' : 'Join Room'}
                         </Button>
                       )}
-                      {room.phase === 'playing' && (
-                        <p className="text-xs text-center text-muted-foreground mt-2">
+                      {!canJoin && room.phase === 'playing' && (
+                        <p className="text-xs text-center text-muted-foreground mt-1">
                           Game in progress
                         </p>
                       )}
@@ -274,7 +291,7 @@ export default function HomePage() {
         </motion.div>
 
         <p className="text-xs text-muted-foreground text-center max-w-sm">
-          Join any open room — the first player becomes host and can add bots or start the game.
+          Join any open room — the first player becomes host and starts the game.
         </p>
       </div>
     </main>

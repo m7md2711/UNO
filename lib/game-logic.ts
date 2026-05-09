@@ -78,15 +78,12 @@ export function canPlayCard(
   pendingDraw: number = 0,
   stackingEnabled: boolean = true
 ): boolean {
-  // If there's a pending draw, only +2 or +4 can be played (if stacking enabled)
+  // If there's a pending draw, only the SAME draw card can stack (+2→+2, +4→+4)
   if (pendingDraw > 0) {
     if (!stackingEnabled) return false;
-    if (topCard.value === 'draw2') {
-      return card.value === 'draw2' || card.value === 'wild4';
-    }
-    if (topCard.value === 'wild4') {
-      return card.value === 'wild4';
-    }
+    if (topCard.value === 'draw2') return card.value === 'draw2';
+    if (topCard.value === 'wild4') return card.value === 'wild4';
+    return false;
   }
   
   // Wild cards can always be played
